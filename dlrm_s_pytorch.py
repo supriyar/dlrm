@@ -110,6 +110,9 @@ with warnings.catch_warnings():
 
 exc = getattr(builtins, "IOError", "FileNotFoundError")
 
+import torch.fx
+torch.fx.wrap("apply_emb_tmp")
+torch.fx.wrap("interact_features_tmp")
 
 def time_wrap(use_gpu):
     if use_gpu:
@@ -153,6 +156,75 @@ def unpack_batch(b):
     # Experiment with unweighted samples
     return b[0], b[1], b[2], b[3], torch.ones(b[3].size()), None
 
+def apply_emb_tmp(lS_o, lS_i, emb_l, v_W_l):
+    # WARNING: notice that we are processing the batch at once. We implicitly
+    # assume that the data is laid out such that:
+    # 1. each embedding is indexed with a group of sparse indices,
+    #   corresponding to a single lookup
+    # 2. for each embedding the lookups are further organized into a batch
+    # 3. for a list of embedding tables there is a list of batched lookups
+
+    ly = []
+    for k, sparse_index_group_batch in enumerate(lS_i):
+        sparse_offset_group_batch = lS_o[k]
+
+        # embedding lookup
+        # We are using EmbeddingBag, which implicitly uses sum operator.
+        # The embeddings are represented as tall matrices, with sum
+        # happening vertically across 0 axis, resulting in a row vector
+        # E = emb_l[k]
+
+        if v_W_l[k] is not None:
+            per_sample_weights = v_W_l[k].gather(0, sparse_index_group_batch)
+        else:
+            per_sample_weights = None
+
+        E = emb_l[k]
+        V = E(
+            sparse_index_group_batch,
+            sparse_offset_group_batch,
+            per_sample_weights=per_sample_weights,
+        )
+
+        ly.append(V)
+
+    # print(ly)
+    return ly
+
+def interact_features_tmp(x, ly, arch_interaction_op, arch_interaction_itself):
+
+        if arch_interaction_op == "dot":
+            # concatenate dense and sparse features
+            (batch_size, d) = x.shape
+            T = torch.cat([x] + ly, dim=1).view((batch_size, -1, d))
+            # perform a dot product
+            Z = torch.bmm(T, torch.transpose(T, 1, 2))
+            # append dense feature with the interactions (into a row vector)
+            # approach 1: all
+            # Zflat = Z.view((batch_size, -1))
+            # approach 2: unique
+            _, ni, nj = Z.shape
+            # approach 1: tril_indices
+            # offset = 0 if self.arch_interaction_itself else -1
+            # li, lj = torch.tril_indices(ni, nj, offset=offset)
+            # approach 2: custom
+            offset = 1 if arch_interaction_itself else 0
+            li = torch.tensor([i for i in range(ni) for j in range(i + offset)])
+            lj = torch.tensor([j for i in range(nj) for j in range(i + offset)])
+            Zflat = Z[:, li, lj]
+            # concatenate dense features and interactions
+            R = torch.cat([x] + [Zflat], dim=1)
+        elif arch_interaction_op == "cat":
+            # concatenation features (into a row vector)
+            R = torch.cat([x] + ly, dim=1)
+        else:
+            sys.exit(
+                "ERROR: --arch-interaction-op="
+                + arch_interaction_op
+                + " is not supported"
+            )
+
+        return R
 
 class LRPolicyScheduler(_LRScheduler):
     def __init__(self, optimizer, num_warmup_steps, decay_start_step, num_decay_steps):
@@ -583,12 +655,12 @@ class DLRM_Net(nn.Module):
         # print(x.detach().cpu().numpy())
 
         # process sparse features(using embeddings), resulting in a list of row vectors
-        ly = self.apply_emb(lS_o, lS_i, self.emb_l, self.v_W_l)
+        ly = apply_emb_tmp(lS_o, lS_i, self.emb_l, self.v_W_l)
         # for y in ly:
         #     print(y.detach().cpu().numpy())
 
         # interact features (dense and sparse)
-        z = self.interact_features(x, ly)
+        z = interact_features_tmp(x, ly, self.arch_interaction_op, self.arch_interaction_itself)
         # print(z.detach().cpu().numpy())
 
         # obtain probability of a click (using top mlp)
@@ -1269,6 +1341,20 @@ def run():
         weighted_pooling=args.weighted_pooling,
         loss_function=args.loss_function
     )
+
+    print("Model ", dlrm)
+    from torch.fx import symbolic_trace
+    from torch.quantization import default_qconfig
+    from torch.quantization.quantize_fx import prepare_fx, convert_fx
+    #gm = symbolic_trace(dlrm)
+    #print(gm)
+
+    qconfig_dict = {"": default_qconfig}
+
+    gm = prepare_fx(dlrm.eval(), qconfig_dict)
+    print(gm)
+    gm = convert_fx(gm)
+    print(gm)
 
     # test prints
     if args.debug_mode:
